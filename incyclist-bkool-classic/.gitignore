@@ -1,0 +1,5 @@
+build-work/
+__pycache__/
+*.pyc
+*_log.txt
+bkool_usb_bridge_log.txt

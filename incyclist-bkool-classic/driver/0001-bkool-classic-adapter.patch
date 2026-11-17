@@ -1,0 +1,555 @@
+From dcba6195210a76fa3ec25b3c01a43b22feb13c4f Mon Sep 17 00:00:00 2001
+From: Bkool Classic contributor <noreply@example.com>
+Date: Tue, 17 Nov 2026 11:45:46 +0100
+Subject: [PATCH] feat(serial): add Bkool Classic (USB) trainer adapter
+
+Adds a serial adapter for the Bkool Trainer Classic, which can be
+connected and controlled via its USB cable (FTDI serial, 115200 8N1).
+
+- registered as serial protocol "Bkool Classic"
+- check(): "$PC#" hello (reply "$RL<id>V<version>#") or console telemetry
+- start(): sends total mass ($CW), wind ($CN0), rolling resistance ($CF4)
+  and flat slope ($CS0)
+- slope control in Smart Trainer mode via "$CS<slope % x 100>#"
+  (negative values supported, clamped to +/-25 %, de-duplicated)
+- power/speed taken from the trainer's console output ("SHOW" / "SPD")
+- SerialInterface.openPort() accepts optional port props (baudRate)
+
+The protocol was reverse engineered from the trainer (firmware V01.13);
+it is not an official Bkool specification. Unit tests use MockBinding.
+---
+ src/serial/base/serial-interface.ts           |   4 +-
+ src/serial/bkool/classic/adapter.ts           | 335 ++++++++++++++++++
+ src/serial/bkool/classic/adapter.unit.test.ts | 129 +++++++
+ src/serial/index.ts                           |   4 +-
+ 4 files changed, 469 insertions(+), 3 deletions(-)
+ create mode 100644 src/serial/bkool/classic/adapter.ts
+ create mode 100644 src/serial/bkool/classic/adapter.unit.test.ts
+
+diff --git a/src/serial/base/serial-interface.ts b/src/serial/base/serial-interface.ts
+index feeb509..47650bc 100644
+--- a/src/serial/base/serial-interface.ts
++++ b/src/serial/base/serial-interface.ts
+@@ -158,7 +158,7 @@ export default class SerialInterface  extends EventEmitter implements IncyclistI
+         await this.disconnect()
+     }
+ 
+-    async openPort(path:string): Promise< SerialPortStream |null> {
++    async openPort(path:string, portProps?:{baudRate?:number}): Promise< SerialPortStream |null> {
+         this.logEvent({message:'opening port',port:path})              
+         const existing = this.ports.findIndex( p=> p.path===path)
+         if (existing!==-1) {
+@@ -172,7 +172,7 @@ export default class SerialInterface  extends EventEmitter implements IncyclistI
+             }
+         }
+ 
+-        const port = SerialPortProvider.getInstance().getSerialPort(this.ifaceName, {path});
++        const port = SerialPortProvider.getInstance().getSerialPort(this.ifaceName, {path, ...(portProps??{})});
+         if (!port) {            
+             this.logEvent({message:'opening port - port does not exist',port:path})
+             return null;
+diff --git a/src/serial/bkool/classic/adapter.ts b/src/serial/bkool/classic/adapter.ts
+new file mode 100644
+index 0000000..2717316
+--- /dev/null
++++ b/src/serial/bkool/classic/adapter.ts
+@@ -0,0 +1,335 @@
++import { EventLogger } from "gd-eventlog";
++import { ReadlineParser } from '@serialport/parser-readline'
++
++import { SerialIncyclistDevice } from "../../base/adapter.js";
++import SerialInterface from "../../base/serial-interface.js";
++import { SerialDeviceSettings } from "../../types.js";
++import SmartTrainerCyclingMode from "../../../modes/antble-smarttrainer.js";
++import PowerMeterCyclingMode from "../../../modes/power-meter.js";
++import { IncyclistBikeData, IncyclistCapability, ControllerConfig, IAdapter, IncyclistAdapterData, DeviceProperties, ITrainer } from "../../../types/index.js";
++import { UpdateRequest } from "../../../modes/types.js";
++import { Sport } from "../../../types/sport.js";
++import { sleep } from "../../../utils/utils.js";
++
++/**
++ * Bkool Trainer Classic connected via its USB cable (FTDI serial, 115200 8N1).
++ *
++ * The trainer streams a text console twice per second:
++ *   WIND:0.000000 i:0.000000 CR:0.008000 M:80 DRAFT:1.000000 PHOTOINT:0
++ *   CAD:0rpm FREQ:3260rpm SPD(r/v):30.7/ 0.0 Kmh POS:110.2 MOT:102 TEMP:315 TARGET:61.5w MAGNET:54.4w SHOW:137w
++ * and accepts text commands "$C<letter><unsigned int>#" (reply "$C<letter>OK#"):
++ *   CS slope   (slope % x 100, e.g. $CS500# = 5 %, $CS-300# = -3 %)
++ *   CF rolling resistance (crr x 1000, default 8)
++ *   CW rider weight in kg
++ *   CN wind (km/h x 100)
++ * "$PC#" returns "$RL<12 hex id>V<version>#".
++ *
++ * Reverse engineered from the trainer; not an official Bkool protocol description.
++ */
++
++export const PROTOCOL_NAME = 'Bkool Classic'
++const BAUD_RATE = 115200
++const CHECK_TIMEOUT = 5000
++const EMIT_INTERVAL = 1000
++const MAX_SLOPE = 25
++const DATA_TIMEOUT = 3000
++const ROLLING_RESISTANCE = 0.004
++
++const RX_TELEMETRY = /CAD:\s*(\d+)rpm.*SPD\(r\/v\):\s*([-\d.]+)\/\s*([-\d.]+).*SHOW:\s*(-?\d+)w/
++const RX_SETTINGS = /WIND:\s*([-\d.]+)\s+i:\s*([-\d.]+)\s+CR:\s*([-\d.]+)\s+M:\s*(\d+)/
++const RX_ID = /\$RL([0-9A-F]{12})V?([\d.]+)?#/i
++
++type BkoolClassicData = {
++    speed: number       // km/h (real wheel speed)
++    power: number       // W (power shown by the trainer)
++    cadence: number     // rpm (always 0 on this hardware)
++    slope?: number      // % as reported by the trainer
++    timestamp: number
++}
++
++export default class BkoolClassicAdapter extends SerialIncyclistDevice<DeviceProperties> implements ITrainer {
++
++    protected static controllers: ControllerConfig = {
++        modes: [SmartTrainerCyclingMode, PowerMeterCyclingMode],
++        default: SmartTrainerCyclingMode
++    }
++
++    protected serial: SerialInterface
++    protected sp: any
++    protected parser: any
++    protected opened = false
++    protected bkoolData: BkoolClassicData
++    protected trainerId: string
++    protected trainerVersion: string
++    protected iv: NodeJS.Timeout
++    protected lastSlopeCmd: number
++    protected lastCrrCmd: number
++    protected distanceInternal = 0
++    protected prevTs: number
++    protected waiters: Array<{ match: RegExp, resolve: (m: RegExpMatchArray) => void }> = []
++
++    constructor(settings: SerialDeviceSettings, props?: DeviceProperties) {
++        super(settings, props)
++        this.logger = new EventLogger('BkoolClassic')
++        this.serial = SerialInterface.getInstance({ ifaceName: settings.interface as string ?? 'serial' })
++        this.capabilities = [IncyclistCapability.Power, IncyclistCapability.Speed, IncyclistCapability.Control]
++    }
++
++    isBike(): boolean { return true }
++    isPower(): boolean { return true }
++    isHrm(): boolean { return false }
++    getProtocolName(): string { return PROTOCOL_NAME }
++    getName(): string { return this.settings.name || PROTOCOL_NAME }
++    getSupportedSports(): Array<Sport> { return ['cycling'] }
++    getSerialInterface(): SerialInterface { return this.serial }
++
++    isSame(device: IAdapter): boolean {
++        if (!(device instanceof BkoolClassicAdapter))
++            return false
++        return device.getPort() === this.getPort()
++    }
++
++    // ---------------------------------------------------------------- serial handling
++
++    async open(): Promise<boolean> {
++        if (this.opened && this.sp?.isOpen)
++            return true
++        try {
++            const port = await this.serial.openPort(this.getPort(), { baudRate: BAUD_RATE })
++            if (!port) {
++                this.logEvent({ message: 'could not open port', port: this.getPort() })
++                return false
++            }
++            this.sp = port
++            this.parser = port.pipe(new ReadlineParser({ delimiter: '\n' }))
++            this.parser.on('data', (line: string) => this.onLine(line))
++            port.on('error', (err) => this.logEvent({ message: 'port error', port: this.getPort(), error: err?.message }))
++            port.on('close', () => { this.opened = false })
++            this.opened = true
++            this.logEvent({ message: 'port opened', port: this.getPort(), baudRate: BAUD_RATE })
++            return true
++        }
++        catch (err) {
++            this.logEvent({ message: 'open failed', port: this.getPort(), error: err?.message })
++            return false
++        }
++    }
++
++    async close(): Promise<boolean> {
++        try {
++            this.parser?.removeAllListeners()
++            if (this.opened)
++                await this.serial.closePort(this.getPort())
++        }
++        catch (err) {
++            this.logEvent({ message: 'close failed', error: err?.message })
++        }
++        this.opened = false
++        this.sp = undefined
++        return true
++    }
++
++    protected onLine(raw: string) {
++        const line = raw.replace(/\0/g, '').trim()
++        if (!line)
++            return
++
++        for (const w of [...this.waiters]) {
++            const m = line.match(w.match)
++            if (m) {
++                this.waiters.splice(this.waiters.indexOf(w), 1)
++                w.resolve(m)
++            }
++        }
++
++        const t = RX_TELEMETRY.exec(line)
++        if (t) {
++            this.bkoolData = {
++                ...(this.bkoolData ?? {}),
++                cadence: Number.parseInt(t[1]),
++                speed: Math.max(0, Number.parseFloat(t[2])),
++                power: Math.max(0, Number.parseInt(t[4])),
++                timestamp: Date.now()
++            }
++            return
++        }
++        const s = RX_SETTINGS.exec(line)
++        if (s) {
++            if (this.bkoolData)
++                this.bkoolData.slope = Number.parseFloat(s[2]) * 100
++            return
++        }
++        if (line.includes('OK#') || line.startsWith('$'))
++            this.logEvent({ message: 'trainer response', line })
++    }
++
++    protected waitFor(match: RegExp, timeout: number): Promise<RegExpMatchArray | undefined> {
++        return new Promise(resolve => {
++            const w = { match, resolve: (m: RegExpMatchArray) => { clearTimeout(to); resolve(m) } }
++            const to = setTimeout(() => {
++                const idx = this.waiters.indexOf(w)
++                if (idx !== -1) this.waiters.splice(idx, 1)
++                resolve(undefined)
++            }, timeout)
++            this.waiters.push(w)
++        })
++    }
++
++    protected write(cmd: string): Promise<void> {
++        return new Promise(resolve => {
++            if (!this.sp?.isOpen) {
++                this.logEvent({ message: 'write skipped, port not open', cmd })
++                resolve()
++                return
++            }
++            this.sp.write(cmd, 'ascii', (err) => {
++                if (err) this.logEvent({ message: 'write failed', cmd, error: err.message })
++                resolve()
++            })
++        })
++    }
++
++    // ---------------------------------------------------------------- trainer commands
++
++    async sendSlope(slopePct: number) {
++        const v = Math.round(Math.max(-MAX_SLOPE, Math.min(slopePct, MAX_SLOPE)) * 100)   // trainer accepts "$CS-300#" for -3 %
++        if (v === this.lastSlopeCmd)
++            return
++        this.lastSlopeCmd = v
++        this.logEvent({ message: 'set slope', slope: slopePct, cmd: `$CS${v}#` })
++        await this.write(`$CS${v}#`)
++    }
++
++    async sendRollingResistance(crr: number) {
++        const v = Math.round(Math.max(0.001, Math.min(crr, 0.05)) * 1000)
++        if (v === this.lastCrrCmd)
++            return
++        this.lastCrrCmd = v
++        await this.write(`$CF${v}#`)
++    }
++
++    async sendDefaults() {
++        // the Bkool app sends the total mass (rider + bike), so do the same
++        const totalWeight = Math.round(Math.max(30, Math.min(this.getWeight(), 200)))
++        this.lastSlopeCmd = undefined
++        this.lastCrrCmd = undefined
++        await this.write(`$CW${totalWeight}#`); await sleep(100)
++        await this.write('$CN0#'); await sleep(100)
++        // trainer default is 0.008; 0.004 matches a road bike on tarmac (and Incyclist's own model)
++        await this.sendRollingResistance(ROLLING_RESISTANCE); await sleep(100)
++        await this.sendSlope(0)
++    }
++
++    // ---------------------------------------------------------------- IncyclistDevice API
++
++    async check(): Promise<boolean> {
++        this.logEvent({ message: 'checking device', port: this.getPort() })
++        if (!await this.open())
++            return false
++
++        const idWait = this.waitFor(RX_ID, CHECK_TIMEOUT)
++        const consoleWait = this.waitFor(RX_TELEMETRY, CHECK_TIMEOUT)
++        await this.write('$PC#')
++        const res = await Promise.race([idWait, consoleWait])
++        if (res && RX_ID.test(res[0])) {
++            this.trainerId = res[1]
++            this.trainerVersion = res[2]
++        }
++        const found = !!res
++        this.logEvent({ message: found ? 'checking device success' : 'checking device failed', port: this.getPort(), id: this.trainerId, version: this.trainerVersion })
++        return found
++    }
++
++    async start(startProps?: DeviceProperties): Promise<boolean> {
++        this.getStartProps(startProps)
++        this.logEvent({ message: 'start()', port: this.getPort() })
++
++        for (let tries = 0; tries < 3; tries++) {
++            if (await this.open()) {
++                const ok = this.bkoolData || await this.waitFor(RX_TELEMETRY, CHECK_TIMEOUT)
++                if (ok) {
++                    await this.sendDefaults()
++                    this.started = true
++                    this.stopped = false
++                    this.paused = false
++                    this.startEmitting()
++                    return true
++                }
++            }
++            await sleep(1000)
++        }
++        throw new Error('could not start device, reason: no data from trainer')
++    }
++
++    async stop(): Promise<boolean> {
++        this.logEvent({ message: 'stop()' })
++        if (this.iv) { clearInterval(this.iv); this.iv = undefined }
++        try { await this.sendSlope(0) } catch { }
++        await this.close()
++        this.stopped = true
++        this.started = false
++        this.paused = false
++        return true
++    }
++
++    protected startEmitting() {
++        if (this.iv)
++            return
++        this.iv = setInterval(() => this.emitTrainerData(), EMIT_INTERVAL)
++    }
++
++    update() { this.emitTrainerData() }
++
++    protected emitTrainerData() {
++        try {
++            const d = this.bkoolData
++            const fresh = d && (Date.now() - d.timestamp) < DATA_TIMEOUT
++            const bikeData: IncyclistBikeData = {
++                power: fresh ? d.power : 0,
++                speed: fresh ? d.speed : 0,
++                pedalRpm: fresh ? d.cadence : 0,
++                isPedalling: fresh ? (d.power > 0 || d.speed > 3) : false,
++                slope: d?.slope
++            }
++
++            const now = Date.now()
++            const dt = this.prevTs ? (now - this.prevTs) / 1000 : 0
++            this.prevTs = now
++
++            const data = this.getCyclingMode().updateData(bikeData)
++            const distance = (data.speed ?? 0) / 3.6 * dt
++            this.distanceInternal += distance
++
++            this.data = {
++                power: data.power,
++                speed: data.speed,
++                cadence: data.pedalRpm,
++                slope: data.slope,
++                distance,
++                internalDistanceCounter: this.distanceInternal,
++                timestamp: now
++            } as IncyclistAdapterData
++            this.emitData(this.data)
++
++            // smart trainer mode may want to refresh the slope regularly
++            const refresh = this.getCyclingMode().buildUpdate({ refresh: true } as UpdateRequest)
++            if (refresh?.slope !== undefined)
++                this.sendSlope(refresh.slope)
++        }
++        catch (err) {
++            this.logEvent({ message: 'update error', error: err?.message, stack: err?.stack })
++        }
++    }
++
++    async sendUpdate(request: UpdateRequest): Promise<UpdateRequest | void> {
++        if (this.paused || !this.started)
++            return
++        const update = this.getCyclingMode().buildUpdate(request)
++        this.logEvent({ message: 'sendUpdate', request, update })
++        if (update?.slope !== undefined)
++            await this.sendSlope(update.slope)
++        return update
++    }
++
++    async connect(): Promise<boolean> { return await this.open() }
++}
+diff --git a/src/serial/bkool/classic/adapter.unit.test.ts b/src/serial/bkool/classic/adapter.unit.test.ts
+new file mode 100644
+index 0000000..dd596ff
+--- /dev/null
++++ b/src/serial/bkool/classic/adapter.unit.test.ts
+@@ -0,0 +1,129 @@
++import { EventLogger } from 'gd-eventlog';
++import { MockBinding } from '@serialport/binding-mock';
++import BkoolClassicAdapter, { PROTOCOL_NAME } from './adapter'
++import SerialPortProvider from '../../base/serial-provider';
++import SerialAdapterFactory from '../../factories/adapter-factory';
++import { MockLogger } from '../../../../test/logger'
++import { sleep } from '../../../utils/utils';
++import '../../index'
++
++const PORT = 'COM7'
++const SETTINGS = { interface: 'serial', port: PORT, protocol: PROTOCOL_NAME, name: 'Bkool Classic' }
++
++const consoleLines = (speed: number, power: number) =>
++    `WIND:0.000000 i:0.000000 CR:0.008000 M:80 DRAFT:1.000000 PHOTOINT:0\r\n` +
++    `CAD:0rpm FREQ:3260rpm SPD(r/v):${speed.toFixed(1)}/ 0.0 Kmh POS:110.2 MOT:102 TEMP:315 TARGET:61.5w MAGNET:54.4w SHOW:${power}w\r\n`
++
++/** simulates the trainer: streams the console and answers the $PC# hello */
++const simulateTrainer = (adapter: any, opts: { answerHello?: boolean, speed?: number, power?: number } = {}) => {
++    const { answerHello = true, speed = 25, power = 180 } = opts
++    let answered = false
++    const iv = setInterval(() => {
++        const port = adapter.sp?.port
++        if (!port) return
++        if (answerHello && !answered && port.recording?.toString().includes('$PC#')) {
++            answered = true
++            port.emitData(Buffer.from('$RL0004A3000001V01.13#\n'))
++        }
++        port.emitData(Buffer.from(consoleLines(speed, power)))
++    }, 50)
++    return () => clearInterval(iv)
++}
++
++const sent = (adapter: any): string => adapter.sp?.port?.recording?.toString() ?? ''
++
++describe('BkoolClassicAdapter', () => {
++
++    beforeAll(() => {
++        EventLogger.useExternalLogger(MockLogger)
++        SerialPortProvider.getInstance().setBinding('serial', MockBinding)
++    })
++
++    beforeEach(() => {
++        MockBinding.reset()
++        MockBinding.createPort(PORT, { echo: false, record: true })
++    })
++
++    test('is registered as serial protocol', () => {
++        const protocols = SerialAdapterFactory.getInstance().adapters.map(a => a.protocol)
++        expect(protocols).toContain('Bkool Classic')
++        const adapter = SerialAdapterFactory.getInstance().createInstance(SETTINGS)
++        expect(adapter).toBeInstanceOf(BkoolClassicAdapter)
++    })
++
++    test('check() identifies the trainer from the $PC# reply', async () => {
++        const adapter = new BkoolClassicAdapter(SETTINGS) as any
++        const stop = simulateTrainer(adapter)
++        const found = await adapter.check()
++        stop()
++        expect(found).toBe(true)
++        expect(adapter.trainerId).toBe('0004A3000001')
++        expect(adapter.trainerVersion).toBe('01.13')
++        expect(sent(adapter)).toContain('$PC#')
++        await adapter.close()
++    })
++
++    test('check() also accepts a trainer that only streams its console', async () => {
++        const adapter = new BkoolClassicAdapter(SETTINGS) as any
++        const stop = simulateTrainer(adapter, { answerHello: false })
++        expect(await adapter.check()).toBe(true)
++        stop()
++        await adapter.close()
++    })
++
++    test('check() fails when nothing answers', async () => {
++        const adapter = new BkoolClassicAdapter(SETTINGS) as any
++        const res = adapter.check()
++        expect(await res).toBe(false)
++        await adapter.close()
++    }, 10000)
++
++    test('start() sends total mass, wind, rolling resistance and flat slope', async () => {
++        const adapter = new BkoolClassicAdapter(SETTINGS) as any
++        const stop = simulateTrainer(adapter)
++        await adapter.start({ userWeight: 75, bikeWeight: 10 })
++        expect(sent(adapter)).toBe('$CW85#$CN0#$CF4#$CS0#')
++        stop()
++        await adapter.stop()
++    })
++
++    test('slope requests are sent as $CS<slope*100>#, clamped and de-duplicated', async () => {
++        const adapter = new BkoolClassicAdapter(SETTINGS) as any
++        const stop = simulateTrainer(adapter)
++        await adapter.start({ userWeight: 75, bikeWeight: 10 })
++        const before = sent(adapter).length
++
++        await adapter.sendSlope(5)
++        await adapter.sendSlope(5)
++        await adapter.sendSlope(-3)
++        await adapter.sendSlope(40)
++        await adapter.sendSlope(-40)
++
++        expect(sent(adapter).slice(before)).toBe('$CS500#$CS-300#$CS2500#$CS-2500#')
++        stop()
++        await adapter.stop()
++    })
++
++    test('emits power and speed from the console', async () => {
++        const adapter = new BkoolClassicAdapter(SETTINGS) as any
++        const stop = simulateTrainer(adapter, { power: 210 })
++        const data: any[] = []
++        adapter.on('data', (_s, d) => data.push(d))
++        await adapter.start({ userWeight: 75, bikeWeight: 10 })
++        await sleep(2500)
++        stop()
++        await adapter.stop()
++
++        expect(data.length).toBeGreaterThan(0)
++        expect(data[data.length - 1].power).toBe(210)
++        expect(data[data.length - 1].speed).toBeGreaterThan(0)
++    })
++
++    test('parses telemetry lines', () => {
++        const adapter = new BkoolClassicAdapter(SETTINGS) as any
++        adapter.onLine('CAD:0rpm FREQ:1240rpm SPD(r/v):11.7/14.0 Kmh POS: 0.0 MOT:0 TEMP:315 TARGET:-7.5w MAGNET: 0.1w SHOW:33w')
++        expect(adapter.bkoolData).toMatchObject({ speed: 11.7, power: 33, cadence: 0 })
++        adapter.onLine('WIND:0.000000 i:0.050000 CR:0.004000 M:85 DRAFT:1.000000 PHOTOINT:1')
++        expect(adapter.bkoolData.slope).toBeCloseTo(5)
++    })
++})
+diff --git a/src/serial/index.ts b/src/serial/index.ts
+index 23ceecd..69bd345 100644
+--- a/src/serial/index.ts
++++ b/src/serial/index.ts
+@@ -7,6 +7,7 @@ import SerialAdapterFactory from './factories/adapter-factory.js';
+ import DaumClassicAdapter from './daum/classic/adapter.js'
+ import DaumPremiumAdapter from './daum/premium/adapter.js';
+ import KettlerRacerAdapter  from './kettler/ergo-racer/adapter.js';
++import BkoolClassicAdapter from './bkool/classic/adapter.js';
+ 
+ export {SerialIncyclistDevice} from './base/adapter.js'
+ export { SerialInterfaceProps,SerialDeviceSettings,SerialScannerProps } from "./types.js";
+@@ -17,11 +18,12 @@ export {DaumClassicProperties} from './daum/classic/types.js'
+ SerialAdapterFactory.getInstance().registerAdapter( 'Daum Classic',DaumClassicAdapter)
+ SerialAdapterFactory.getInstance().registerAdapter( 'Daum Premium',DaumPremiumAdapter)
+ SerialAdapterFactory.getInstance().registerAdapter( 'Kettler Racer', KettlerRacerAdapter)
++SerialAdapterFactory.getInstance().registerAdapter( 'Bkool Classic', BkoolClassicAdapter)
+ 
+ 
+ export {
+     // Adapters
+-    SerialAdapterFactory,DaumClassicAdapter, DaumPremiumAdapter,KettlerRacerAdapter,
++    SerialAdapterFactory,DaumClassicAdapter, DaumPremiumAdapter,KettlerRacerAdapter,BkoolClassicAdapter,
+ 
+     SerialPortProvider,useSerialPortProvider, 
+     SerialInterface
+-- 
+2.43.0
+
